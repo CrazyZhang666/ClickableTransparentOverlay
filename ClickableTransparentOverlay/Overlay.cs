@@ -3,26 +3,29 @@
     using System;
     using System.Collections.Generic;
     using System.Diagnostics;
-    using System.Numerics;
     using System.Threading;
     using System.Threading.Tasks;
+    using ImGuiNET;
     using Veldrid;
     using Veldrid.ImageSharp;
     using Veldrid.Sdl2;
     using Veldrid.StartupUtilities;
 
-    // TODO: Implement overlay info, warn, error logger.
     /// <summary>
     /// A class to create clickable transparent overlay.
     /// </summary>
     public abstract class Overlay : IDisposable
     {
+        private readonly SDL_WindowFlags windowFlags =
+            SDL_WindowFlags.Borderless | SDL_WindowFlags.AlwaysOnTop | SDL_WindowFlags.SkipTaskbar;
+
+        private readonly Dictionary<string, Texture> loadedImages =
+            new Dictionary<string, Texture>();
+
         private volatile Sdl2Window window;
         private GraphicsDevice graphicsDevice;
         private CommandList commandList;
         private ImGuiController imController;
-        private Vector4 clearColor;
-        private Dictionary<string, Texture> loadedImages;
 
         private Thread renderThread;
         private volatile CancellationTokenSource cancellationTokenSource;
@@ -33,8 +36,6 @@
         /// </summary>
         public Overlay()
         {
-            clearColor = new Vector4(0.00f, 0.00f, 0.00f, 0.00f);
-            loadedImages = new Dictionary<string, Texture>();
         }
 
         /// <summary>
@@ -46,23 +47,13 @@
             cancellationTokenSource = new CancellationTokenSource();
             renderThread = new Thread(async () =>
             {
-                window = new Sdl2Window(
-                    "Overlay",
-                    0,
-                    0,
-                    2560,
-                    1440,
-                    SDL_WindowFlags.Borderless |
-                    SDL_WindowFlags.AlwaysOnTop |
-                    SDL_WindowFlags.SkipTaskbar,
-                    false);
-                graphicsDevice = VeldridStartup.CreateDefaultD3D11GraphicsDevice(
+                window = new Sdl2Window("Overlay", 0, 0, 2560, 1440, this.windowFlags, false);
+                graphicsDevice = VeldridStartup.CreateGraphicsDevice(window,
                     new GraphicsDeviceOptions(false, null, true),
-                    window);
+                    GraphicsBackend.Direct3D11);
                 commandList = graphicsDevice.ResourceFactory.CreateCommandList();
                 imController = new ImGuiController(
                     graphicsDevice,
-                    graphicsDevice.MainSwapchain.Framebuffer.OutputDescription,
                     window.Width,
                     window.Height);
                 window.Resized += () =>
@@ -71,14 +62,16 @@
                     imController.WindowResized(window.Width, window.Height);
                 };
 
-                NativeMethods.InitKeyTimeoutMechanism();
                 NativeMethods.InitTransparency(window.Handle);
                 NativeMethods.SetOverlayClickable(window.Handle, false);
+                AddFonts();
+                imController.Start();
                 if (!overlayIsReady)
                 {
                     overlayIsReady = true;
                 }
 
+                PostStart();
                 await RunInfiniteLoop(cancellationTokenSource.Token);
             });
             
@@ -105,12 +98,15 @@
         /// </summary>
         private async Task RunInfiniteLoop(CancellationToken cancellationToken)
         {
-            var stopwatch = new Stopwatch();
-            stopwatch.Start();
+            var stopwatch = Stopwatch.StartNew();
             while (window.Exists && !cancellationToken.IsCancellationRequested)
             {
                 InputSnapshot snapshot = window.PumpEvents();
-                if (!window.Exists) { break; }
+                if (!window.Exists)
+                {
+                    Close();
+                    break;
+                }
 
                 var deltaSeconds = (float)stopwatch.ElapsedTicks / Stopwatch.Frequency;
                 stopwatch.Restart();
@@ -120,7 +116,7 @@
 
                 commandList.Begin();
                 commandList.SetFramebuffer(graphicsDevice.MainSwapchain.Framebuffer);
-                commandList.ClearColorTarget(0, new RgbaFloat(clearColor.X, clearColor.Y, clearColor.Z, clearColor.W));
+                commandList.ClearColorTarget(0, new RgbaFloat(0.00f, 0.00f, 0.00f, 0.00f));
                 imController.Render(graphicsDevice, commandList);
                 commandList.End();
                 graphicsDevice.SubmitCommands(commandList);
@@ -136,6 +132,21 @@
         /// </summary>
         /// <returns>Task that finishes once per frame</returns>
         protected abstract Task Render();
+
+        /// <summary>
+        /// Adds default font to the ImGui.
+        /// This method can be overridden to add additional fonts
+        /// to the ImGui at the startup time.
+        /// </summary>
+        protected virtual void AddFonts()
+        {
+            ImGui.GetIO().Fonts.AddFontDefault();
+        }
+
+        /// <summary>
+        /// Steps to execute after the overlay has fully initialized.
+        /// </summary>
+        protected virtual void PostStart() { }
 
         /// <summary>
         /// Safely Closes the Overlay.
@@ -175,7 +186,8 @@
         /// Gets the monitor bounds based on the monitor number.
         /// </summary>
         /// <param name="num">Monitor number starting from 0.</param>
-        /// <returns>screen box in which the window is moved to.</returns>
+        /// <returns>monitor bounds in case of valid monitor number
+        /// otherwise current overlay window bounds.</returns>
         public Rectangle GetDisplayBounds(int num)
         {
             int numDisplays = NumberVideoDisplays;
@@ -184,8 +196,7 @@
                 return new Rectangle(Position, Size);
             }
 
-            var bounds = new Rectangle();
-            SDL2Functions.SDL_GetDisplayBounds(num, ref bounds);
+            SDL2Functions.SDL_GetDisplayBounds(num, out Rectangle bounds);
             return bounds;
         }
 
